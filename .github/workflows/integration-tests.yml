@@ -55,6 +55,25 @@ on:
         options:
           - kafka
           - redis
+      go_sdk_ref:
+        description: 'Git ref (branch/tag) of pipeshub-ai/pipeshub-sdk-go to test'
+        required: false
+        default: 'main'
+      run_sdk_tests:
+        description: 'Run SDK example app tests (Go SDK)'
+        required: false
+        default: false
+        type: boolean
+      run_integration_tests:
+        description: 'Run backend integration tests (pytest). Uncheck to skip.'
+        required: false
+        default: true
+        type: boolean
+      run_playwright_tests:
+        description: 'Run frontend Playwright e2e tests. Uncheck to skip.'
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: read
@@ -70,13 +89,13 @@ jobs:
     runs-on: runs-on=${{ github.run_id }}/runner=4cpu-linux-x64/volume=100gb/ssh=true
     timeout-minutes: 120
 
-    # Schedule uses a separate environment so daily runs are not blocked by
-    # deployment protection on `integration-test-dev`. Create
+    # pull_request_target uses `integration-test-dev`; everything else (schedule
+    # and manual workflow_dispatch) uses `integration-test-daily`. Create
     # `integration-test-daily` in repo Settings → Environments with the same
     # environment secrets as `integration-test-dev`, but leave required
-    # reviewers / wait timer disabled.
+    # reviewers / wait timer disabled so runs are not blocked.
     environment:
-      name: ${{ github.event_name == 'schedule' && 'integration-test-daily' || 'integration-test-dev' }}
+      name: ${{ github.event_name == 'pull_request_target' && 'integration-test-dev' || 'integration-test-daily' }}
 
     env:
       SECRET_KEY: ${{ secrets.SECRET_KEY }}
@@ -160,6 +179,22 @@ jobs:
           uv venv
           uv pip install -e .
 
+      # Go SDK example apps run on the daily scheduled run, or on manual dispatch
+      # when run_sdk_tests is enabled.
+      - name: Set up Go
+        if: github.event_name == 'schedule' || github.event.inputs.run_sdk_tests == 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Checkout Go SDK repo
+        if: github.event_name == 'schedule' || github.event.inputs.run_sdk_tests == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: pipeshub-ai/pipeshub-sdk-go
+          path: pipeshub-sdk-go
+          ref: ${{ github.event.inputs.go_sdk_ref || 'main' }}
+
       - name: 'Neo4j: Start services'
         if: env.GRAPH_DB == 'neo4j' || env.GRAPH_DB == 'both'
         working-directory: deployment/docker-compose
@@ -238,7 +273,7 @@ jobs:
           echo "Onboarding marked as configured!"
 
       - name: 'Neo4j: Run integration tests'
-        if: env.GRAPH_DB == 'neo4j' || env.GRAPH_DB == 'both'
+        if: (env.GRAPH_DB == 'neo4j' || env.GRAPH_DB == 'both') && github.event.inputs.run_integration_tests != 'false'
         working-directory: integration-tests
         run: |
           source .venv/bin/activate
@@ -246,7 +281,7 @@ jobs:
           pytest -m "$MARKERS" -v --tb=short --junitxml=reports/neo4j-results.xml 2>&1
 
       - name: 'Neo4j: Run Playwright e2e tests'
-        if: always() && (env.GRAPH_DB == 'neo4j' || env.GRAPH_DB == 'both')
+        if: always() && (env.GRAPH_DB == 'neo4j' || env.GRAPH_DB == 'both') && github.event.inputs.run_playwright_tests != 'false'
         working-directory: frontend
         env:
           CI: 'true'
@@ -257,16 +292,36 @@ jobs:
           TEST_USER_PASSWORD: ${{ env.PIPESHUB_TEST_USER_PASSWORD }}
         run: npm run test:e2e 2>&1
 
+      - name: 'Neo4j: Seed Go SDK example data'
+        if: always() && (github.event_name == 'schedule' || github.event.inputs.run_sdk_tests == 'true') && (env.GRAPH_DB == 'neo4j' || env.GRAPH_DB == 'both')
+        working-directory: integration-tests
+        env:
+          SDK_EXAMPLES_ENV_PATH: ${{ github.workspace }}/pipeshub-sdk-go/examples/.env
+        run: |
+          source .venv/bin/activate
+          python sdk_examples/seed_sdk_examples.py
+
+      - name: 'Neo4j: Run Go SDK examples'
+        if: always() && (github.event_name == 'schedule' || github.event.inputs.run_sdk_tests == 'true') && (env.GRAPH_DB == 'neo4j' || env.GRAPH_DB == 'both')
+        working-directory: integration-tests
+        env:
+          GO_SDK_DIR: ${{ github.workspace }}/pipeshub-sdk-go
+          SDK_EXAMPLES_ENV_PATH: ${{ github.workspace }}/pipeshub-sdk-go/examples/.env
+        run: bash sdk_examples/run_and_report.sh
+
       - name: 'Neo4j: Dump docker logs'
         if: always() && (env.GRAPH_DB == 'neo4j' || env.GRAPH_DB == 'both')
         working-directory: deployment/docker-compose
         run: |
           mkdir -p ../../integration-tests/reports/docker-logs/neo4j
-          docker compose -f docker-compose.integration.neo4j.yml ps -a \
-            > ../../integration-tests/reports/docker-logs/neo4j/_containers.txt 2>&1 || true
+          # Strip ANSI escape sequences and C0 control bytes (keep tab/newline/CR)
+          # so the dumped logs open as plain text in editors instead of "binary".
+          sanitize() { sed -r 's/\x1B\[[0-9;?]*[a-zA-Z]//g' | tr -d '\000-\010\013-\037'; }
+          docker compose -f docker-compose.integration.neo4j.yml ps -a 2>&1 \
+            | sanitize > ../../integration-tests/reports/docker-logs/neo4j/_containers.txt || true
           for svc in $(docker compose -f docker-compose.integration.neo4j.yml config --services); do
-            docker compose -f docker-compose.integration.neo4j.yml logs --no-color --timestamps "$svc" \
-              > "../../integration-tests/reports/docker-logs/neo4j/${svc}.log" 2>&1 || true
+            docker compose -f docker-compose.integration.neo4j.yml logs --no-color --timestamps "$svc" 2>&1 \
+              | sanitize > "../../integration-tests/reports/docker-logs/neo4j/${svc}.log" || true
           done
 
       - name: 'Neo4j: Tear down services (preserve images)'
@@ -352,7 +407,7 @@ jobs:
           echo "Onboarding marked as configured!"
 
       - name: 'ArangoDB: Run integration tests'
-        if: always() && (env.GRAPH_DB == 'arango' || env.GRAPH_DB == 'both')
+        if: always() && (env.GRAPH_DB == 'arango' || env.GRAPH_DB == 'both') && github.event.inputs.run_integration_tests != 'false'
         working-directory: integration-tests
         run: |
           source .venv/bin/activate
@@ -360,7 +415,7 @@ jobs:
           pytest -m "$MARKERS" -v --tb=short --junitxml=reports/arango-results.xml 2>&1
 
       - name: 'ArangoDB: Run Playwright e2e tests'
-        if: always() && env.GRAPH_DB == 'arango'
+        if: always() && env.GRAPH_DB == 'arango' && github.event.inputs.run_playwright_tests != 'false'
         working-directory: frontend
         env:
           CI: 'true'
@@ -371,16 +426,36 @@ jobs:
           TEST_USER_PASSWORD: ${{ env.PIPESHUB_TEST_USER_PASSWORD }}
         run: npm run test:e2e 2>&1
 
+      - name: 'ArangoDB: Seed Go SDK example data'
+        if: always() && (github.event_name == 'schedule' || github.event.inputs.run_sdk_tests == 'true') && (env.GRAPH_DB == 'arango' || env.GRAPH_DB == 'both')
+        working-directory: integration-tests
+        env:
+          SDK_EXAMPLES_ENV_PATH: ${{ github.workspace }}/pipeshub-sdk-go/examples/.env
+        run: |
+          source .venv/bin/activate
+          python sdk_examples/seed_sdk_examples.py
+
+      - name: 'ArangoDB: Run Go SDK examples'
+        if: always() && (github.event_name == 'schedule' || github.event.inputs.run_sdk_tests == 'true') && (env.GRAPH_DB == 'arango' || env.GRAPH_DB == 'both')
+        working-directory: integration-tests
+        env:
+          GO_SDK_DIR: ${{ github.workspace }}/pipeshub-sdk-go
+          SDK_EXAMPLES_ENV_PATH: ${{ github.workspace }}/pipeshub-sdk-go/examples/.env
+        run: bash sdk_examples/run_and_report.sh
+
       - name: 'ArangoDB: Dump docker logs'
         if: always() && (env.GRAPH_DB == 'arango' || env.GRAPH_DB == 'both')
         working-directory: deployment/docker-compose
         run: |
           mkdir -p ../../integration-tests/reports/docker-logs/arango
-          docker compose -f docker-compose.integration.arango.yml ps -a \
-            > ../../integration-tests/reports/docker-logs/arango/_containers.txt 2>&1 || true
+          # Strip ANSI escape sequences and C0 control bytes (keep tab/newline/CR)
+          # so the dumped logs open as plain text in editors instead of "binary".
+          sanitize() { sed -r 's/\x1B\[[0-9;?]*[a-zA-Z]//g' | tr -d '\000-\010\013-\037'; }
+          docker compose -f docker-compose.integration.arango.yml ps -a 2>&1 \
+            | sanitize > ../../integration-tests/reports/docker-logs/arango/_containers.txt || true
           for svc in $(docker compose -f docker-compose.integration.arango.yml config --services); do
-            docker compose -f docker-compose.integration.arango.yml logs --no-color --timestamps "$svc" \
-              > "../../integration-tests/reports/docker-logs/arango/${svc}.log" 2>&1 || true
+            docker compose -f docker-compose.integration.arango.yml logs --no-color --timestamps "$svc" 2>&1 \
+              | sanitize > "../../integration-tests/reports/docker-logs/arango/${svc}.log" || true
           done
 
       - name: 'ArangoDB: Tear down services (preserve images)'
@@ -471,9 +546,32 @@ jobs:
             PW_PASS_RATE=0
           fi
 
-          # Overall health: green only when both suites are fully passing
+          # Parse Go SDK examples JUnit XML
+          GOSDK_TESTS=0
+          GOSDK_PASSED=0
+          GOSDK_FAILED=0
+          GOSDK_ERRORS=0
+          GOSDK_SKIPPED=0
+          if [ -f "reports/gosdk-results.xml" ]; then
+            gosdk_tests=$(grep -oP 'tests="\K[0-9]+' "reports/gosdk-results.xml" | head -1)
+            gosdk_failures=$(grep -oP 'failures="\K[0-9]+' "reports/gosdk-results.xml" | head -1)
+            gosdk_errors=$(grep -oP 'errors="\K[0-9]+' "reports/gosdk-results.xml" | head -1)
+            gosdk_skipped=$(grep -oP 'skipped="\K[0-9]+' "reports/gosdk-results.xml" | head -1)
+            GOSDK_TESTS=${gosdk_tests:-0}
+            GOSDK_FAILED=${gosdk_failures:-0}
+            GOSDK_ERRORS=${gosdk_errors:-0}
+            GOSDK_SKIPPED=${gosdk_skipped:-0}
+            GOSDK_PASSED=$((GOSDK_TESTS - GOSDK_FAILED - GOSDK_ERRORS - GOSDK_SKIPPED))
+          fi
+          if [ "$GOSDK_TESTS" -gt 0 ]; then
+            GOSDK_PASS_RATE=$(( (GOSDK_PASSED * 100) / GOSDK_TESTS ))
+          else
+            GOSDK_PASS_RATE=0
+          fi
+
+          # Overall health: green only when all suites are fully passing
           OVERALL_OK=true
-          if [ "$TOTAL_FAILED" -gt 0 ] || [ "$TOTAL_ERRORS" -gt 0 ] || [ "$PW_FAILED" -gt 0 ] || [ "$PW_ERRORS" -gt 0 ]; then
+          if [ "$TOTAL_FAILED" -gt 0 ] || [ "$TOTAL_ERRORS" -gt 0 ] || [ "$PW_FAILED" -gt 0 ] || [ "$PW_ERRORS" -gt 0 ] || [ "$GOSDK_FAILED" -gt 0 ] || [ "$GOSDK_ERRORS" -gt 0 ]; then
             OVERALL_OK=false
           fi
 
@@ -489,6 +587,12 @@ jobs:
           echo "PW_ERRORS=$PW_ERRORS" >> "$GITHUB_OUTPUT"
           echo "PW_SKIPPED=$PW_SKIPPED" >> "$GITHUB_OUTPUT"
           echo "PW_PASS_RATE=$PW_PASS_RATE" >> "$GITHUB_OUTPUT"
+          echo "GOSDK_TESTS=$GOSDK_TESTS" >> "$GITHUB_OUTPUT"
+          echo "GOSDK_PASSED=$GOSDK_PASSED" >> "$GITHUB_OUTPUT"
+          echo "GOSDK_FAILED=$GOSDK_FAILED" >> "$GITHUB_OUTPUT"
+          echo "GOSDK_ERRORS=$GOSDK_ERRORS" >> "$GITHUB_OUTPUT"
+          echo "GOSDK_SKIPPED=$GOSDK_SKIPPED" >> "$GITHUB_OUTPUT"
+          echo "GOSDK_PASS_RATE=$GOSDK_PASS_RATE" >> "$GITHUB_OUTPUT"
           echo "OVERALL_OK=$OVERALL_OK" >> "$GITHUB_OUTPUT"
           echo "TRIGGER_LABEL=$TRIGGER_LABEL" >> "$GITHUB_OUTPUT"
           echo "AUTHOR=$AUTHOR" >> "$GITHUB_OUTPUT"
@@ -583,6 +687,15 @@ jobs:
                       { "type": "raw_text", "text": "${{ steps.test-results.outputs.PW_ERRORS }}"                  },
                       { "type": "raw_text", "text": "${{ steps.test-results.outputs.PW_SKIPPED }}"                 },
                       { "type": "raw_text", "text": "${{ steps.test-results.outputs.PW_PASS_RATE }}%"              }
+                    ],
+                    [
+                      { "type": "raw_text", "text": "Go SDK (examples)"                                             },
+                      { "type": "raw_text", "text": "${{ steps.test-results.outputs.GOSDK_TESTS }}"                },
+                      { "type": "raw_text", "text": "${{ steps.test-results.outputs.GOSDK_PASSED }}"               },
+                      { "type": "raw_text", "text": "${{ steps.test-results.outputs.GOSDK_FAILED }}"               },
+                      { "type": "raw_text", "text": "${{ steps.test-results.outputs.GOSDK_ERRORS }}"               },
+                      { "type": "raw_text", "text": "${{ steps.test-results.outputs.GOSDK_SKIPPED }}"              },
+                      { "type": "raw_text", "text": "${{ steps.test-results.outputs.GOSDK_PASS_RATE }}%"           }
                     ]
                   ]
                 },
@@ -652,7 +765,7 @@ jobs:
             -d "$COMPLETE_PAYLOAD"
 
       - name: Send failed tests list to Slack thread
-        if: always() && (steps.test-results.outputs.TOTAL_FAILED != '0' || steps.test-results.outputs.TOTAL_ERRORS != '0' || steps.test-results.outputs.PW_FAILED != '0' || steps.test-results.outputs.PW_ERRORS != '0')
+        if: always() && (steps.test-results.outputs.TOTAL_FAILED != '0' || steps.test-results.outputs.TOTAL_ERRORS != '0' || steps.test-results.outputs.PW_FAILED != '0' || steps.test-results.outputs.PW_ERRORS != '0' || steps.test-results.outputs.GOSDK_FAILED != '0' || steps.test-results.outputs.GOSDK_ERRORS != '0')
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           CHANNEL_ID: ${{ vars.SLACK_CI_CHANNEL_ID }}
@@ -676,7 +789,7 @@ jobs:
               sys.exit(0)
 
           names = []
-          for xml_path in ['reports/neo4j-results.xml', 'reports/arango-results.xml', 'reports/playwright/playwright-junit.xml']:
+          for xml_path in ['reports/neo4j-results.xml', 'reports/arango-results.xml', 'reports/playwright/playwright-junit.xml', 'reports/gosdk-results.xml']:
               if not os.path.exists(xml_path):
                   continue
               backend = os.path.basename(xml_path).replace('-results.xml', '')
